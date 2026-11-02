@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""
+MedEdgeNet-Seg V4 Lite: entrenamiento, evaluación y monitorización energética.
+
+Estructura esperada:
+MedEdgeNet_Dataset/
+  images/im0001.ppm
+  images/im0002.ppm
+  masks/im0001.vk.ppm
+  masks/im0002.vk.ppm
+
+Instalación:
+pip install torch torchvision pillow numpy pandas scikit-learn psutil pynvml
+Opcional para FLOPs:
+pip install thop
+Opcional para telemetría NVIDIA:
+pip install nvidia-ml-py
+
+Ejecución:
+python mededgenet_v4_lite.py --data_dir ./MedEdgeNet_Dataset --epochs 100 --batch_size 4
+"""
+
+import os
+import csv
+import time
+import json
+import random
+import argparse
+import platform
+import threading
+from pathlib import Path
+from contextlib import contextmanager
+
+import numpy as np
+import pandas as pd
+import psutil
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+
+
+# --------------------------- Reproducibilidad ---------------------------
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# --------------------------- Medición de recursos ---------------------------
+
+class StageMonitor:
+    """
+    Monitorización por etapa con NVML/pynvml:
+    potencia, energía, temperatura, utilización, VRAM y clocks.
+    La potencia se muestrea periódicamente y la energía se integra
+    mediante la regla trapezoidal. Si NVML ofrece energía acumulada,
+    también se registra como referencia.
+    """
+    def __init__(self, name, output_dir, device, sample_interval=0.25, gpu_index=0):
+        self.name = name
+        self.output_dir = Path(output_dir)
+        self.device = device
+        self.sample_interval = sample_interval
+        self.gpu_index = gpu_index
+        self.start_time = None
+        self.ram_start = None
+        self.ram_end_mb = None
+        self.vram_peak_mb = 0.0
+        self.nvml_available = False
+        self.nvml_error = None
+        self.nvml = None
+        self.handle = None
+        self.stop_event = threading.Event()
+        self.sampler_thread = None
+        self.samples = []
+        self.energy_kwh_integrated = None
+        self.energy_kwh_nvml = None
+
+    def _read_nvml_sample(self):
+        now = time.perf_counter()
+        sample = {"t": now}
+        try:
+            sample["power_w"] = self.nvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0
+        except Exception:
+            sample["power_w"] = None
+        try:
+            sample["temperature_c"] = self.nvml.nvmlDeviceGetTemperature(
+                self.handle, self.nvml.NVML_TEMPERATURE_GPU
+            )
+        except Exception:
+            sample["temperature_c"] = None
+        try:
+            util = self.nvml.nvmlDeviceGetUtilizationRates(self.handle)
+            sample["gpu_util_pct"] = float(util.gpu)
+            sample["memory_util_pct"] = float(util.memory)
+        except Exception:
+            sample["gpu_util_pct"] = None
+            sample["memory_util_pct"] = None
+        try:
+            mem = self.nvml.nvmlDeviceGetMemoryInfo(self.handle)
+            sample["vram_used_mb"] = mem.used / (1024 ** 2)
+            sample["vram_total_mb"] = mem.total / (1024 ** 2)
+        except Exception:
+            sample["vram_used_mb"] = None
+            sample["vram_total_mb"] = None
+        try:
+            sample["graphics_clock_mhz"] = self.nvml.nvmlDeviceGetClockInfo(
+                self.handle, self.nvml.NVML_CLOCK_GRAPHICS
+            )
+        except Exception:
+            sample["graphics_clock_mhz"] = None
+        try:
+            sample["memory_clock_mhz"] = self.nvml.nvmlDeviceGetClockInfo(
+                self.handle, self.nvml.NVML_CLOCK_MEM
+            )
+        except Exception:
+            sample["memory_clock_mhz"] = None
+        self.samples.append(sample)
+
+    def _sample_loop(self):
+        while not self.stop_event.is_set():
+            self._read_nvml_sample()
+            self.stop_event.wait(self.sample_interval)
+        # Muestra final para aproximar el extremo del intervalo.
+        self._read_nvml_sample()
+
+    def __enter__(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+        self.ram_start = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
+        self.start_time = time.perf_counter()
+
+        if self.device.type == "cuda":
+            try:
+                import pynvml
+                self.nvml = pynvml
+                self.nvml.nvmlInit()
+                self.handle = self.nvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+                self.nvml_available = True
+                self._read_nvml_sample()
+                try:
+                    self.energy_start_mj = self.nvml.nvmlDeviceGetTotalEnergyConsumption(self.handle)
+                except Exception:
+                    self.energy_start_mj = None
+                self.sampler_thread = threading.Thread(
+                    target=self._sample_loop, daemon=True
+                )
+                self.sampler_thread.start()
+            except Exception as exc:
+                self.nvml_error = f"{type(exc).__name__}: {exc}"
+                self.nvml_available = False
+                if self.nvml is not None:
+                    try:
+                        self.nvml.nvmlShutdown()
+                    except Exception:
+                        pass
+                    self.nvml = None
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+        if self.sampler_thread is not None:
+            self.stop_event.set()
+            self.sampler_thread.join()
+        elif self.nvml_available:
+            self._read_nvml_sample()
+
+        self.elapsed_s = time.perf_counter() - self.start_time
+        self.ram_end_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
+
+        if self.device.type == "cuda":
+            self.vram_peak_mb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+
+        # Integración trapezoidal de potencia (W*s = J).
+        valid_power = [
+            (s["t"], s["power_w"]) for s in self.samples
+            if s.get("power_w") is not None
+        ]
+        energy_j = 0.0
+        for (t0, p0), (t1, p1) in zip(valid_power[:-1], valid_power[1:]):
+            energy_j += ((p0 + p1) / 2.0) * max(0.0, t1 - t0)
+        self.energy_kwh_integrated = (
+            energy_j / 3_600_000.0 if len(valid_power) >= 2 else None
+        )
+
+        # Energía acumulada del dispositivo, cuando el driver la soporta.
+        if self.nvml_available:
+            try:
+                total_mj = self.nvml.nvmlDeviceGetTotalEnergyConsumption(self.handle)
+                # API NVML devuelve mJ acumulados desde el inicio del driver.
+                # Se necesita una lectura inicial y final para obtener el delta.
+                self.energy_kwh_nvml = None
+                if getattr(self, "energy_start_mj", None) is not None:
+                    delta_mj = max(0, total_mj - self.energy_start_mj)
+                    self.energy_kwh_nvml = delta_mj / 3_600_000_000.0
+            except Exception:
+                self.energy_kwh_nvml = None
+
+            try:
+                self.nvml.nvmlShutdown()
+            except Exception:
+                pass
+
+        powers = [s["power_w"] for s in self.samples if s.get("power_w") is not None]
+        temps = [s["temperature_c"] for s in self.samples if s.get("temperature_c") is not None]
+        utils = [s["gpu_util_pct"] for s in self.samples if s.get("gpu_util_pct") is not None]
+        mem_utils = [s["memory_util_pct"] for s in self.samples if s.get("memory_util_pct") is not None]
+        vram = [s["vram_used_mb"] for s in self.samples if s.get("vram_used_mb") is not None]
+
+        self.gpu_stats = {
+            "nvml_available": self.nvml_available,
+            "nvml_error": self.nvml_error,
+            "nvml_samples": len(self.samples),
+            "gpu_power_avg_w": float(np.mean(powers)) if powers else None,
+            "gpu_power_max_w": float(np.max(powers)) if powers else None,
+            "gpu_energy_integrated_kwh": self.energy_kwh_integrated,
+            "gpu_energy_nvml_kwh": self.energy_kwh_nvml,
+            "gpu_temperature_avg_c": float(np.mean(temps)) if temps else None,
+            "gpu_temperature_max_c": float(np.max(temps)) if temps else None,
+            "gpu_util_avg_pct": float(np.mean(utils)) if utils else None,
+            "gpu_util_max_pct": float(np.max(utils)) if utils else None,
+            "gpu_memory_util_avg_pct": float(np.mean(mem_utils)) if mem_utils else None,
+            "gpu_vram_used_avg_mb": float(np.mean(vram)) if vram else None,
+            "gpu_vram_used_max_mb": float(np.max(vram)) if vram else None,
+            "gpu_vram_peak_torch_mb": self.vram_peak_mb,
+        }
+
+        # Guardar muestras crudas para auditoría y análisis posterior.
+        if self.samples:
+            sample_path = self.output_dir / "nvml_samples.csv"
+            rows = []
+            for s in self.samples:
+                rows.append({
+                    "stage": self.name,
+                    "elapsed_seconds": s["t"] - self.start_time,
+                    **{k: v for k, v in s.items() if k != "t"}
+                })
+            write_header = not sample_path.exists()
+            with open(sample_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(rows)
+
+        return False
+
+
+class MeasurementLog:
+    def __init__(self, output_dir):
+        self.path = Path(output_dir) / "resource_measurements.csv"
+        self.rows = []
+
+    def add(self, stage, monitor, epoch=None, extra=None):
+        self.rows.append({
+            "stage": stage,
+            "epoch": epoch,
+            "time_seconds": getattr(monitor, "elapsed_s", None),
+            "ram_start_mb": monitor.ram_start,
+            "ram_end_mb": monitor.ram_end_mb,
+            **getattr(monitor, "gpu_stats", {}),
+            **(extra or {})
+        })
+        pd.DataFrame(self.rows).to_csv(self.path, index=False)
+
+
+class EpochEnergyLog:
+    """Agrega entrenamiento + validación y calcula energía acumulada por época."""
+    def __init__(self, output_dir):
+        self.path = Path(output_dir) / "epoch_energy.csv"
+        self.rows = []
+        self.cumulative_kwh = 0.0
+        self.cumulative_known = True
+        self.best_dice_so_far = None
+
+    @staticmethod
+    def _energy_kwh(monitor):
+        # Preferir el contador NVML del dispositivo; si no está disponible,
+        # utilizar la integración trapezoidal de potencia.
+        nvml_energy = getattr(monitor, "energy_kwh_nvml", None)
+        integrated = getattr(monitor, "energy_kwh_integrated", None)
+        return nvml_energy if nvml_energy is not None else integrated
+
+    def add_epoch(self, epoch, train_monitor, val_monitor, train_metrics,
+                  val_metrics, learning_rate, improved):
+        train_kwh = self._energy_kwh(train_monitor)
+        val_kwh = self._energy_kwh(val_monitor)
+        epoch_kwh = (
+            train_kwh + val_kwh
+            if train_kwh is not None and val_kwh is not None else None
+        )
+
+        if epoch_kwh is None:
+            self.cumulative_known = False
+        elif self.cumulative_known:
+            self.cumulative_kwh += epoch_kwh
+
+        previous_best = self.best_dice_so_far
+        if improved:
+            self.best_dice_so_far = float(val_metrics["dice"])
+
+        dice_gain = (
+            float(val_metrics["dice"]) - previous_best
+            if previous_best is not None else None
+        )
+        wh_per_001_dice = None
+        if epoch_kwh and dice_gain is not None and dice_gain > 0:
+            wh_per_001_dice = (epoch_kwh * 1000.0) / (dice_gain / 0.001)
+
+        row = {
+            "epoch": epoch,
+            "learning_rate": learning_rate,
+            "train_time_s": getattr(train_monitor, "elapsed_s", None),
+            "validation_time_s": getattr(val_monitor, "elapsed_s", None),
+            "epoch_time_s": (
+                getattr(train_monitor, "elapsed_s", 0.0)
+                + getattr(val_monitor, "elapsed_s", 0.0)
+            ),
+            "train_gpu_energy_kwh": train_kwh,
+            "validation_gpu_energy_kwh": val_kwh,
+            "epoch_gpu_energy_kwh": epoch_kwh,
+            "epoch_gpu_energy_wh": epoch_kwh * 1000.0 if epoch_kwh is not None else None,
+            "cumulative_gpu_energy_kwh": (
+                self.cumulative_kwh if self.cumulative_known else None
+            ),
+            "train_gpu_power_avg_w": train_monitor.gpu_stats.get("gpu_power_avg_w"),
+            "validation_gpu_power_avg_w": val_monitor.gpu_stats.get("gpu_power_avg_w"),
+            "train_gpu_temp_max_c": train_monitor.gpu_stats.get("gpu_temperature_max_c"),
+            "validation_gpu_temp_max_c": val_monitor.gpu_stats.get("gpu_temperature_max_c"),
+            "train_vram_peak_torch_mb": train_monitor.gpu_stats.get("gpu_vram_peak_torch_mb"),
+            "validation_vram_peak_torch_mb": val_monitor.gpu_stats.get("gpu_vram_peak_torch_mb"),
+            "train_loss": train_metrics["loss"],
+            "validation_loss": val_metrics["loss"],
+            "train_dice": train_metrics["dice"],
+            "validation_dice": val_metrics["dice"],
+            "validation_iou": val_metrics["iou"],
+            "validation_f1": val_metrics["f1"],
+            "validation_sensitivity": val_metrics["sensitivity"],
+            "validation_precision": val_metrics["precision"],
+            "validation_dice_gain_vs_previous_best": dice_gain,
+            "gpu_wh_per_0_001_dice_gain": wh_per_001_dice,
+            "improved_best": bool(improved),
+        }
+        self.rows.append(row)
+        pd.DataFrame(self.rows).to_csv(self.path, index=False)
+        return row
+
+
+# --------------------------- Dataset PPM ---------------------------
+
+class MedEdgeDataset(Dataset):
+    def __init__(self, pairs, size=512, augment=False):
+        self.pairs = pairs
+        self.size = size
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.pairs)
+
+    @staticmethod
+    def letterbox(image, size, is_mask=False):
+        w, h = image.size
+        scale = size / max(w, h)
+        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+        interp = Image.Resampling.NEAREST if is_mask else Image.Resampling.BILINEAR
+        image = image.resize((nw, nh), interp)
+        mode = "L" if is_mask else "RGB"
+        canvas = Image.new(mode, (size, size), 0)
+        canvas.paste(image, ((size - nw) // 2, (size - nh) // 2))
+        return canvas
+
+    def __getitem__(self, idx):
+        image_path, mask_path = self.pairs[idx]
+        with Image.open(image_path) as im:
+            image = im.convert("RGB")
+        with Image.open(mask_path) as mk:
+            mask = mk.convert("L")
+
+        if image.size != mask.size:
+            raise ValueError(
+                f"Dimensiones distintas en {image_path.name}: "
+                f"imagen={image.size}, máscara={mask.size}"
+            )
+
+        image = self.letterbox(image, self.size, False)
+        mask = self.letterbox(mask, self.size, True)
+
+        x = np.asarray(image, dtype=np.float32) / 255.0
+        y_raw = np.asarray(mask, dtype=np.uint8)
+
+        # Máscara binaria: cualquier píxel >=128 se considera vaso.
+        y = (y_raw >= 128).astype(np.float32)
+
+        # Augmentations geométricas sincronizadas.
+        if self.augment:
+            if random.random() < 0.5:
+                x, y = np.fliplr(x).copy(), np.fliplr(y).copy()
+            if random.random() < 0.5:
+                x, y = np.flipud(x).copy(), np.flipud(y).copy()
+            k = random.randint(0, 3)
+            if k:
+                x, y = np.rot90(x, k).copy(), np.rot90(y, k).copy()
+
+            # Cambios fotométricos solo en la imagen.
+            if random.random() < 0.3:
+                gain = random.uniform(0.9, 1.1)
+                bias = random.uniform(-0.05, 0.05)
+                x = np.clip(x * gain + bias, 0, 1)
+
+        x = torch.from_numpy(x.copy()).permute(2, 0, 1).float()
+        y = torch.from_numpy(y.copy()).unsqueeze(0).float()
+        return x, y
+
+
+def discover_pairs(data_dir):
+    image_dir = Path(data_dir) / "images"
+    mask_dir = Path(data_dir) / "masks"
+    if not image_dir.is_dir() or not mask_dir.is_dir():
+        raise FileNotFoundError(
+            "Se esperan las carpetas images/ y masks/ dentro de --data_dir."
+        )
+
+    pairs, missing = [], []
+    for image_path in sorted(image_dir.glob("*.ppm")):
+        if image_path.name.lower().endswith(".vk.ppm"):
+            continue
+        mask_path = mask_dir / f"{image_path.stem}.vk.ppm"
+        if mask_path.exists():
+            pairs.append((image_path, mask_path))
+        else:
+            missing.append(image_path.name)
+
+    if missing:
+        print(f"AVISO: {len(missing)} imágenes sin máscara. Ejemplos: {missing[:5]}")
+    if len(pairs) < 3:
+        raise RuntimeError(
+            f"Solo se encontraron {len(pairs)} pares válidos. "
+            "Se necesitan al menos 3 para train/val/test."
+        )
+
+    # Comprobaciones y resumen de dimensiones / valores de máscaras.
+    sizes = set()
+    mask_values = set()
+    for ip, mp in pairs:
+        with Image.open(ip) as im, Image.open(mp) as mk:
+            if im.size != mk.size:
+                raise ValueError(f"Dimensiones no coinciden: {ip.name}")
+            sizes.add(im.size)
+            arr = np.asarray(mk.convert("L"))
+            mask_values.update(np.unique(arr).tolist())
+
+    print(f"Pares imagen-máscara: {len(pairs)}")
+    print(f"Resoluciones originales encontradas: {sorted(sizes)}")
+    print(f"Valores de máscara observados (muestra completa): {sorted(mask_values)[:30]}")
+    if not set(mask_values).issubset({0, 255}):
+        print("AVISO: hay valores de máscara distintos de 0/255; se binarizarán con umbral 128.")
+    return pairs
+
+
+# --------------------------- Arquitectura V4 Lite ---------------------------
+
+class ConvBNAct(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel=1, stride=1, groups=1, activation=True):
+        super().__init__()
+        padding = kernel // 2
+        layers = [
+            nn.Conv2d(in_ch, out_ch, kernel, stride, padding,
+                      groups=groups, bias=False),
+            nn.BatchNorm2d(out_ch)
+        ]
+        if activation:
+            layers.append(nn.SiLU(inplace=True))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DSConv(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1, dilation=1):
+        super().__init__()
+        self.depthwise = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, stride=stride,
+                      padding=dilation, dilation=dilation,
+                      groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            nn.SiLU(inplace=True)
+        )
+        self.pointwise = ConvBNAct(in_ch, out_ch, kernel=1)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        self.main = DSConv(in_ch, out_ch, stride=stride)
+        self.skip = (
+            ConvBNAct(in_ch, out_ch, kernel=1, stride=stride, activation=False)
+            if stride != 1 or in_ch != out_ch else nn.Identity()
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.main(x) + self.skip(x))
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.skip_proj = ConvBNAct(skip_ch, out_ch, kernel=1)
+        self.up_proj = ConvBNAct(in_ch, out_ch, kernel=1)
+        self.refine = DSConv(out_ch, out_ch, stride=1)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear",
+                          align_corners=False)
+        x = self.up_proj(x) + self.skip_proj(skip)
+        return self.refine(x)
+
+
+class MedEdgeNetSegV4Lite(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1):
+        super().__init__()
+        self.stem = ConvBNAct(in_channels, 16, kernel=3, stride=2)
+
+        self.e1 = EncoderBlock(16, 16, stride=1)   # 1/2
+        self.e2 = EncoderBlock(16, 24, stride=2)   # 1/4
+        self.e3 = EncoderBlock(24, 40, stride=2)   # 1/8
+        self.e4 = EncoderBlock(40, 80, stride=2)   # 1/16
+        self.e5 = EncoderBlock(80, 112, stride=2)  # 1/32
+
+        self.b1 = DSConv(112, 112, dilation=1)
+        self.b2 = DSConv(112, 112, dilation=2)
+
+        self.d4 = DecoderBlock(112, 80, 80)
+        self.d3 = DecoderBlock(80, 40, 40)
+        self.d2 = DecoderBlock(40, 24, 24)
+        self.d1 = DecoderBlock(24, 16, 16)
+
+        self.head = nn.Conv2d(16, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        input_size = x.shape[-2:]
+        x = self.stem(x)
+        s1 = self.e1(x)
+        s2 = self.e2(s1)
+        s3 = self.e3(s2)
+        s4 = self.e4(s3)
+        x = self.e5(s4)
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.d4(x, s4)
+        x = self.d3(x, s3)
+        x = self.d2(x, s2)
+        x = self.d1(x, s1)
+        x = F.interpolate(x, size=input_size, mode="bilinear",
+                          align_corners=False)
+        return self.head(x)  # logits; aplicar sigmoid fuera
+
+
+# --------------------------- Loss y métricas ---------------------------
+
+def dice_loss(logits, targets, eps=1e-6):
+    probs = torch.sigmoid(logits)
+    dims = (1, 2, 3)
+    intersection = (probs * targets).sum(dims)
+    denominator = probs.sum(dims) + targets.sum(dims)
+    dice = (2 * intersection + eps) / (denominator + eps)
+    return 1 - dice.mean()
+
+
+def combined_loss(logits, targets):
+    return 0.5 * F.binary_cross_entropy_with_logits(logits, targets) + \
+           0.5 * dice_loss(logits, targets)
+
+
+@torch.no_grad()
+def calculate_metrics(logits, targets, threshold=0.5, eps=1e-7):
+    pred = torch.sigmoid(logits) >= threshold
+    truth = targets >= 0.5
+    tp = (pred & truth).sum().item()
+    fp = (pred & ~truth).sum().item()
+    fn = (~pred & truth).sum().item()
+    tn = (~pred & ~truth).sum().item()
+
+    dice = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+    iou = (tp + eps) / (tp + fp + fn + eps)
+    precision = (tp + eps) / (tp + fp + eps)
+    sensitivity = (tp + eps) / (tp + fn + eps)
+    f1 = (2 * precision * sensitivity) / (precision + sensitivity + eps)
+    accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
+    return {
+        "dice": dice, "iou": iou, "f1": f1,
+        "precision": precision, "sensitivity": sensitivity,
+        "accuracy": accuracy
+    }
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# --------------------------- Train / validation / test ---------------------------
+
+def run_epoch(model, loader, optimizer, device, scaler, amp_enabled, training):
+    model.train(training)
+    total_loss = 0.0
+    metric_sums = {}
+    batches = 0
+
+    for images, masks in loader:
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        with torch.set_grad_enabled(training):
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                logits = model(images)
+                loss = combined_loss(logits, masks)
+
+            if training:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+        total_loss += loss.item()
+        batch_metrics = calculate_metrics(logits.detach(), masks)
+        for key, value in batch_metrics.items():
+            metric_sums[key] = metric_sums.get(key, 0.0) + value
+        batches += 1
+
+    if batches == 0:
+        raise RuntimeError("DataLoader vacío.")
+    result = {"loss": total_loss / batches}
+    result.update({k: v / batches for k, v in metric_sums.items()})
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="MedEdgeNet_Dataset")
+    parser.add_argument("--output_dir", type=str, default="runs_mededge_v4_lite")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--min_epochs", type=int, default=20,
+                        help="No detener por early stopping antes de este número de épocas.")
+    parser.add_argument("--patience", type=int, default=12,
+                        help="Épocas consecutivas sin mejora para detener.")
+    parser.add_argument("--min_delta", type=float, default=0.001,
+                        help="Mejora mínima del Dice de validación para reiniciar patience.")
+    parser.add_argument("--scheduler_patience", type=int, default=4,
+                        help="Paciencia del scheduler ReduceLROnPlateau.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Activar mixed precision en GPU compatible.")
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Dispositivo: {device}")
+    print(f"PyTorch: {torch.__version__} | SO: {platform.platform()}")
+
+    measurements = MeasurementLog(output_dir)
+    epoch_energy_log = EpochEnergyLog(output_dir)
+
+    # Etapa 1: indexado y validación de pares.
+    with StageMonitor("dataset_index", output_dir, device) as mon:
+        pairs = discover_pairs(args.data_dir)
+    measurements.add("dataset_index", mon)
+
+    # División reproducible por imagen. Si hay varias imágenes por paciente,
+    # sustituir por división agrupada por paciente para evitar fuga de datos.
+    train_pairs, temp_pairs = train_test_split(
+        pairs, test_size=0.30, random_state=args.seed, shuffle=True
+    )
+    val_pairs, test_pairs = train_test_split(
+        temp_pairs, test_size=0.50, random_state=args.seed, shuffle=True
+    )
+    print(f"Train={len(train_pairs)} | Val={len(val_pairs)} | Test={len(test_pairs)}")
+
+    with open(output_dir / "split_manifest.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "train": [p[0].name for p in train_pairs],
+            "validation": [p[0].name for p in val_pairs],
+            "test": [p[0].name for p in test_pairs]
+        }, f, indent=2)
+
+    # Etapa 2: preparación de DataLoaders.
+    with StageMonitor("dataloader_setup", output_dir, device) as mon:
+        train_ds = MedEdgeDataset(train_pairs, args.size, augment=True)
+        val_ds = MedEdgeDataset(val_pairs, args.size, augment=False)
+        test_ds = MedEdgeDataset(test_pairs, args.size, augment=False)
+
+        pin = device.type == "cuda"
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=pin,
+            persistent_workers=args.num_workers > 0
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            persistent_workers=args.num_workers > 0
+        )
+        test_loader = DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin
+        )
+    measurements.add("dataloader_setup", mon)
+
+    # Etapa 3: creación del modelo y perfil de complejidad.
+    with StageMonitor("model_initialization", output_dir, device) as mon:
+        model = MedEdgeNetSegV4Lite().to(device)
+        params = count_parameters(model)
+        print(f"Parámetros entrenables: {params:,}")
+
+        try:
+            from thop import profile
+            dummy = torch.randn(1, 3, args.size, args.size, device=device)
+            flops, thop_params = profile(model, inputs=(dummy,), verbose=False)
+            print(f"FLOPs estimados por imagen: {flops:,.0f}")
+        except Exception as exc:
+            flops = None
+            print(f"FLOPs no calculados (instala thop): {exc}")
+    measurements.add("model_initialization", mon,
+                     extra={"trainable_parameters": params, "flops": flops})
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=args.scheduler_patience
+    )
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+    history = []
+    best_dice = -1.0
+    epochs_without_improvement = 0
+    best_path = output_dir / "best_mededgenet_v4_lite.pth"
+
+    # Etapa 4: entrenamiento y validación, monitorizados por época.
+    for epoch in range(1, args.epochs + 1):
+        print(f"\\nÉpoca {epoch}/{args.epochs}")
+
+        with StageMonitor(f"train_epoch_{epoch}", output_dir, device) as train_mon:
+            train_metrics = run_epoch(
+                model, train_loader, optimizer, device, scaler,
+                amp_enabled, training=True
+            )
+        measurements.add("training", train_mon, epoch=epoch)
+
+        with StageMonitor(f"validation_epoch_{epoch}", output_dir, device) as val_mon:
+            val_metrics = run_epoch(
+                model, val_loader, None, device, scaler,
+                amp_enabled, training=False
+            )
+        measurements.add("validation", val_mon, epoch=epoch)
+
+        scheduler.step(val_metrics["dice"])
+        improved = val_metrics["dice"] > (best_dice + args.min_delta)
+
+        if improved:
+            best_dice = val_metrics["dice"]
+            epochs_without_improvement = 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch,
+                "best_val_dice": best_dice,
+                "args": vars(args)
+            }, best_path)
+        else:
+            epochs_without_improvement += 1
+
+        row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
+        row.update({f"train_{k}": v for k, v in train_metrics.items()})
+        row.update({f"val_{k}": v for k, v in val_metrics.items()})
+        history.append(row)
+        pd.DataFrame(history).to_csv(output_dir / "training_history.csv", index=False)
+
+        energy_row = epoch_energy_log.add_epoch(
+            epoch, train_mon, val_mon, train_metrics, val_metrics,
+            optimizer.param_groups[0]["lr"], improved
+        )
+        epoch_energy_wh = energy_row["epoch_gpu_energy_wh"]
+        energy_text = (
+            f"{epoch_energy_wh:.3f} Wh"
+            if epoch_energy_wh is not None else "NVML energía no disponible"
+        )
+
+        print(
+            f"Train loss={train_metrics['loss']:.4f} | "
+            f"Val loss={val_metrics['loss']:.4f} | "
+            f"Val Dice={val_metrics['dice']:.4f} | "
+            f"Val F1={val_metrics['f1']:.4f} | "
+            f"Val IoU={val_metrics['iou']:.4f} | "
+            f"Energía GPU época={energy_text}"
+        )
+
+        if epoch >= args.min_epochs and epochs_without_improvement >= args.patience:
+            print(
+                f"Early stopping en época {epoch}: "
+                f"{args.patience} épocas sin mejora > {args.min_delta:.4f} "
+                f"(mínimo {args.min_epochs} épocas)."
+            )
+            break
+
+    # Etapa 5: evaluación final con el mejor checkpoint.
+    with StageMonitor("test_evaluation", output_dir, device) as mon:
+        checkpoint = torch.load(best_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        test_metrics = run_epoch(
+            model, test_loader, None, device, scaler,
+            amp_enabled, training=False
+        )
+    measurements.add("test_evaluation", mon)
+    with open(output_dir / "test_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(test_metrics, f, indent=2)
+
+    # Etapa 6: exportación y resumen.
+    with StageMonitor("export", output_dir, device) as mon:
+        torch.save(model.state_dict(), output_dir / "mededgenet_v4_lite_weights.pth")
+        with open(output_dir / "final_summary.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "best_epoch": checkpoint["epoch"],
+                "best_validation_dice": checkpoint["best_val_dice"],
+                "test_metrics": test_metrics,
+                "parameters": params,
+                "flops": flops,
+                "device": str(device),
+                "amp_enabled": amp_enabled,
+                "epochs_completed": len(history),
+                "early_stopping": {
+                    "min_epochs": args.min_epochs,
+                    "patience": args.patience,
+                    "min_delta": args.min_delta,
+                    "scheduler_patience": args.scheduler_patience
+                },
+                "epoch_energy_csv": "epoch_energy.csv",
+                "energy_note": (
+                    "Energía GPU; contador NVML si está disponible, "
+                    "en otro caso integración de potencia muestreada. "
+                    "No representa el consumo total del ordenador."
+                )
+            }, f, indent=2)
+    measurements.add("export", mon)
+
+    print("\n========== RESULTADOS TEST ==========")
+    for key, value in test_metrics.items():
+        print(f"{key}: {value:.5f}")
+    print(f"Mejor época: {checkpoint['epoch']}")
+    print(f"Parámetros: {params:,}")
+    print(f"Resultados y mediciones: {output_dir.resolve()}")
+    print("Resumen NVML: resource_measurements.csv")
+    print("Muestras NVML: nvml_samples.csv")
+    print("Historial: training_history.csv")
+    print("Energía y métricas por época: epoch_energy.csv")
+    print(
+        f"Early stopping: min_epochs={args.min_epochs}, "
+        f"patience={args.patience}, min_delta={args.min_delta}"
+    )
+
+
+if __name__ == "__main__":
+    main()
